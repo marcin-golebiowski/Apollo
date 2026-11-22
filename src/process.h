@@ -98,6 +98,7 @@ namespace proc {
     bool terminate_on_pause;
     int  scale_factor;
     std::chrono::seconds exit_timeout;
+    bool is_stream_test = false;
   };
 
   class proc_t {

@@ -21,6 +21,11 @@ target_link_libraries(audio-info
         ${PLATFORM_LIBRARIES})
 target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+add_executable(stream-test WIN32 stream-test.cpp)
+set_target_properties(stream-test PROPERTIES CXX_STANDARD 23)
+target_link_libraries(stream-test PRIVATE d2d1 dwrite winmm)
+target_compile_options(stream-test PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
 add_executable(sunshinesvc sunshinesvc.cpp)
 set_target_properties(sunshinesvc PROPERTIES CXX_STANDARD 23)
 target_link_libraries(sunshinesvc

@@ -1,4 +1,5 @@
 # windows specific target definitions
+add_dependencies(sunshine stream-test)
 set_target_properties(sunshine PROPERTIES LINK_SEARCH_START_STATIC 1)
 set(CMAKE_FIND_LIBRARY_SUFFIXES ".dll")
 find_library(ZLIB ZLIB1)

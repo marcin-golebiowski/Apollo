@@ -60,6 +60,7 @@ namespace proc {
   std::string terminate_app_id_str;
 
 #ifdef _WIN32
+  constexpr char stream_test_uuid[] = "384422A1-C915-4527-83C3-1F44581C774A";
   VDISPLAY::DRIVER_STATUS vDisplayDriverStatus = VDISPLAY::DRIVER_STATUS::UNKNOWN;
 
   void onVDisplayWatchdogFailed() {
@@ -486,7 +487,32 @@ namespace proc {
                                               find_working_directory(_app.cmd, _env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing: ["sv << _app.cmd << "] in ["sv << working_dir << ']';
-      _process = platf::run_command(_app.elevated, true, _app.cmd, working_dir, _env, _pipe.get(), ec, &_process_group);
+      const auto *command_env = &_env;
+#ifdef _WIN32
+      std::optional<boost::process::v1::environment> test_env;
+      if (_app.is_stream_test) {
+        auto &env = test_env.emplace(_env);
+        std::string target = display_name;
+        if (target.empty()) {
+          target = display_device::map_output_name(config::video.output_name);
+          if (target.empty()) {
+            // Capture defaults to the first output available for duplication.
+            const auto outputs = platf::display_names(platf::mem_type_e::dxgi);
+            if (!outputs.empty()) {
+              target = outputs.front();
+            }
+          }
+        }
+        env["APOLLO_CAPTURE_DISPLAY"] = target;
+        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        env["APOLLO_STREAM_TEST_EPOCH_MS"] = std::to_string(epoch_ms);
+        BOOST_LOG(info) << "Stream Test timeline: epoch " << epoch_ms << " ms (Unix), requested " << fps_str << " fps";
+        command_env = &env;
+      }
+#endif
+      _process = platf::run_command(_app.elevated, true, _app.cmd, working_dir, *command_env, _pipe.get(), ec, &_process_group);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't run ["sv << _app.cmd << "]: System: "sv << ec.message();
         return -1;
@@ -1547,7 +1573,7 @@ namespace proc {
           // Fallback to include index on collision
           ctx.id = std::get<1>(possible_ids);
         }
-        // ids.insert(ctx.id);
+        ids.insert(ctx.id);
 
         terminate_app_id_str = ctx.id;
         terminate_app_id = util::from_view(ctx.id);
@@ -1555,6 +1581,37 @@ namespace proc {
         apps.emplace_back(std::move(ctx));
       }
     }
+
+#ifdef _WIN32
+    // Append after user apps and existing built-ins to preserve their ordering and IDs.
+    const auto test_exe = platf::appdata().parent_path() / "tools" / "stream-test.exe";
+    std::error_code file_error;
+    const bool already_configured = std::any_of(apps.begin(), apps.end(), [](const ctx_t &app) {
+      return boost::iequals(app.name, "Stream Test") || boost::iequals(app.uuid, stream_test_uuid);
+    });
+    if (!already_configured && std::filesystem::is_regular_file(test_exe, file_error)) {
+      proc::ctx_t ctx {};
+      ctx.idx = std::to_string(i);
+      ctx.uuid = stream_test_uuid;
+      ctx.name = "Stream Test";
+      ctx.is_stream_test = true;
+      ctx.image_path = "stream-test.png";
+      ctx.cmd = '"' + platf::to_utf8(test_exe.native()) + '"';
+      ctx.working_dir = platf::to_utf8(test_exe.parent_path().native());
+      ctx.scale_factor = 100;
+      ctx.allow_client_commands = true;
+      ctx.terminate_on_pause = true;
+      ctx.exit_timeout = 2s;
+
+      // A change to the artwork or the position in the list must not change the TV's shortcut.
+      std::string id_key = ctx.uuid;
+      do {
+        ctx.id = std::to_string(calculate_crc32(id_key) & 0x7fffffffU);
+        id_key += '#';
+      } while (ids.count(ctx.id));
+      apps.emplace_back(std::move(ctx));
+    }
+#endif
 
     return proc::proc_t {
       std::move(this_env),

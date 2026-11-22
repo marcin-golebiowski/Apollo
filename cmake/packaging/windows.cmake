@@ -23,7 +23,7 @@ install(TARGETS dxgi-info RUNTIME DESTINATION "tools" COMPONENT dxgi)
 install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
 
 # Mandatory tools
-install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
+install(TARGETS sunshinesvc stream-test RUNTIME DESTINATION "tools" COMPONENT application)
 
 # Drivers
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/drivers/sudovda"
