@@ -1052,6 +1052,12 @@ namespace platf::dxgi {
 
   class d3d_nvenc_encode_device_t: public nvenc_encode_device_t {
   public:
+    ~d3d_nvenc_encode_device_t() override {
+      // Display reinitialization waits for this reference. NVENC owns its D3D device
+      // and input texture, so a stalled encoder teardown need not hold up capture.
+      base.display.reset();
+    }
+
     bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
       buffer_format = nvenc::nvenc_format_from_sunshine_format(pix_fmt);
       if (buffer_format == NV_ENC_BUFFER_FORMAT_UNDEFINED) {
