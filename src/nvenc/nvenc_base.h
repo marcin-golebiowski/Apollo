@@ -19,6 +19,12 @@
  */
 namespace nvenc {
 
+  enum class async_wait_result {
+    signaled,
+    timeout,
+    failed,
+  };
+
   /**
    * @brief Abstract platform-agnostic base of standalone NVENC encoder.
    *        Derived classes perform platform-specific operations.
@@ -98,10 +104,10 @@ namespace nvenc {
      * @brief Optional. Override if you want to create encoder in async mode.
      *        In this case must also set `async_event_handle` variable.
      * @param timeout_ms Wait timeout in milliseconds
-     * @return `true` on success, `false` on timeout or error
+     * @return Whether the frame completed, the interval elapsed, or the wait failed.
      */
-    virtual bool wait_for_async_event(uint32_t timeout_ms) {
-      return false;
+    virtual async_wait_result wait_for_async_event(uint32_t timeout_ms) {
+      return async_wait_result::failed;
     }
 
     bool nvenc_failed(NVENCSTATUS status);

@@ -61,8 +61,17 @@ namespace nvenc {
     return false;
   }
 
-  bool nvenc_d3d11::wait_for_async_event(uint32_t timeout_ms) {
-    return WaitForSingleObject(async_event_handle, timeout_ms) == WAIT_OBJECT_0;
+  async_wait_result nvenc_d3d11::wait_for_async_event(uint32_t timeout_ms) {
+    switch (WaitForSingleObject(async_event_handle, timeout_ms)) {
+      case WAIT_OBJECT_0:
+        return async_wait_result::signaled;
+      case WAIT_TIMEOUT:
+        return async_wait_result::timeout;
+      default:
+        const auto error_code = GetLastError();
+        BOOST_LOG(error) << "NvEnc: completion event wait failed (Win32 error " << error_code << ")";
+        return async_wait_result::failed;
+    }
   }
 
 }  // namespace nvenc

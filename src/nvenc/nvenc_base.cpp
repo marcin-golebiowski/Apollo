@@ -530,9 +530,22 @@ namespace nvenc {
     lock_bitstream.outputBitstream = output_bitstream;
     lock_bitstream.doNotWait = async_event_handle ? 1 : 0;
 
-    if (async_event_handle && !wait_for_async_event(100)) {
-      BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode wait timeout";
-      return {};
+    if (async_event_handle) {
+      constexpr uint32_t wait_interval_ms = 100;
+      auto result = wait_for_async_event(wait_interval_ms);
+      if (result == async_wait_result::timeout) {
+        // A late frame can still complete sooner than tearing down and recreating the encoder.
+        // Wait once more on the same submitted picture, keeping both buffers in place.
+        result = wait_for_async_event(wait_interval_ms);
+        if (result == async_wait_result::signaled) {
+          BOOST_LOG(warning) << "NvEnc: frame " << frame_index << " completed after the first " << wait_interval_ms << " ms wait";
+        } else if (result == async_wait_result::timeout) {
+          BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode wait timeout";
+        }
+      }
+      if (result != async_wait_result::signaled) {
+        return {};
+      }
     }
 
     if (nvenc_failed(nvenc->nvEncLockBitstream(encoder, &lock_bitstream))) {
