@@ -3,8 +3,9 @@
 if(DEFINED ENV{BRANCH})
     set(GITHUB_BRANCH $ENV{BRANCH})
 endif()
-if(DEFINED ENV{BUILD_VERSION})  # cmake-lint: disable=W0106
-    set(BUILD_VERSION $ENV{BUILD_VERSION})
+set(BUILD_VERSION "" CACHE STRING "Version to report for this build, for example 0.4.6+local")
+if(NOT "$ENV{BUILD_VERSION}" STREQUAL "")
+    set(BUILD_VERSION "$ENV{BUILD_VERSION}")
 endif()
 if(DEFINED ENV{CLONE_URL})
     set(GITHUB_CLONE_URL $ENV{CLONE_URL})
@@ -16,15 +17,16 @@ if(DEFINED ENV{TAG})
     set(GITHUB_TAG $ENV{TAG})
 endif()
 
-# Check if env vars are defined before attempting to access them, variables will be defined even if blank
-if((DEFINED ENV{BRANCH}) AND (DEFINED ENV{BUILD_VERSION}))  # cmake-lint: disable=W0106
-    if((DEFINED ENV{BRANCH}) AND (NOT $ENV{BUILD_VERSION} STREQUAL ""))
-        # If BRANCH is defined and BUILD_VERSION is not empty, then we are building from CI
-        # If BRANCH is master we are building a push/release build
-        MESSAGE("Got from CI '$ENV{BRANCH}' branch and version '$ENV{BUILD_VERSION}'")
-        set(PROJECT_VERSION $ENV{BUILD_VERSION})
-        string(REGEX REPLACE "^v" "" PROJECT_VERSION ${PROJECT_VERSION})  # remove the v prefix if it exists
-        set(CMAKE_PROJECT_VERSION ${PROJECT_VERSION})  # cpack will use this to set the binary versions
+if(NOT "${BUILD_VERSION}" STREQUAL "")
+    string(REGEX REPLACE "^v" "" PROJECT_VERSION "${BUILD_VERSION}")
+    set(CMAKE_PROJECT_VERSION "${PROJECT_VERSION}")
+    if(NOT GITHUB_COMMIT AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+        find_package(Git QUIET)
+        if(GIT_FOUND)
+            execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                    OUTPUT_VARIABLE GITHUB_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
+        endif()
     endif()
 else()
     # Generate Sunshine Version based of the git tag
