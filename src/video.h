@@ -206,6 +206,8 @@ namespace video {
   struct encode_session_t {
     virtual ~encode_session_t() = default;
 
+    bool produced_packet {};
+
     virtual int convert(platf::img_t &img) = 0;
 
     virtual void request_idr_frame() = 0;

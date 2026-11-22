@@ -28,6 +28,7 @@ extern "C" {
 #include "src/nvenc/nvenc_d3d11_on_cuda.h"
 #include "src/nvenc/nvenc_utils.h"
 #include "src/video.h"
+#include "texture_lock.h"
 
 #if !defined(SUNSHINE_SHADERS_DIR)  // for testing this needs to be defined in cmake as we don't do an install
   #define SUNSHINE_SHADERS_DIR SUNSHINE_ASSETS_DIR "/shaders/directx"
@@ -157,55 +158,23 @@ namespace platf::dxgi {
     };
   };
 
-  struct texture_lock_helper {
-    keyed_mutex_t _mutex;
-    bool _locked = false;
-
-    texture_lock_helper(const texture_lock_helper &) = delete;
-    texture_lock_helper &operator=(const texture_lock_helper &) = delete;
-
-    texture_lock_helper(texture_lock_helper &&other) {
-      _mutex.reset(other._mutex.release());
-      _locked = other._locked;
-      other._locked = false;
+  capture_e texture_capture_result(HRESULT status) {
+    switch (status) {
+      case S_OK:
+        return capture_e::ok;
+      case WAIT_TIMEOUT:
+        BOOST_LOG(warning) << "Timed out waiting for the shared capture texture";
+        break;
+      case WAIT_ABANDONED:
+        BOOST_LOG(warning) << "Shared capture texture mutex was abandoned";
+        break;
+      default:
+        BOOST_LOG(error) << "Shared capture texture synchronization failed [0x"sv << util::hex(status).to_string_view() << ']';
+        break;
     }
-
-    texture_lock_helper &operator=(texture_lock_helper &&other) {
-      if (_locked) {
-        _mutex->ReleaseSync(0);
-      }
-      _mutex.reset(other._mutex.release());
-      _locked = other._locked;
-      other._locked = false;
-      return *this;
-    }
-
-    texture_lock_helper(IDXGIKeyedMutex *mutex):
-        _mutex(mutex) {
-      if (_mutex) {
-        _mutex->AddRef();
-      }
-    }
-
-    ~texture_lock_helper() {
-      if (_locked) {
-        _mutex->ReleaseSync(0);
-      }
-    }
-
-    bool lock() {
-      if (_locked) {
-        return true;
-      }
-      HRESULT status = _mutex->AcquireSync(0, INFINITE);
-      if (status == S_OK) {
-        _locked = true;
-      } else {
-        BOOST_LOG(error) << "Failed to acquire texture mutex [0x"sv << util::hex(status).to_string_view() << ']';
-      }
-      return _locked;
-    }
-  };
+    // Discard the shared texture pool. Retrying the same mutex can time out indefinitely.
+    return capture_e::reinit;
+  }
 
   util::buffer_t<std::uint8_t> make_cursor_xor_image(const util::buffer_t<std::uint8_t> &img_data, DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info) {
     constexpr std::uint32_t inverted = 0xFFFFFFFF;
@@ -404,13 +373,6 @@ namespace platf::dxgi {
           return -1;
         }
 
-        // Acquire encoder mutex to synchronize with capture code
-        auto status = img_ctx.encoder_mutex->AcquireSync(0, INFINITE);
-        if (status != S_OK) {
-          BOOST_LOG(error) << "Failed to acquire encoder mutex [0x"sv << util::hex(status).to_string_view() << ']';
-          return -1;
-        }
-
         auto draw = [&](auto &input, auto &y_or_yuv_viewports, auto &uv_viewport) {
           device_ctx->PSSetShaderResources(0, 1, &input);
 
@@ -434,23 +396,24 @@ namespace platf::dxgi {
           }
         };
 
-        // Clear render target view(s) once so that the aspect ratio mismatch "bars" appear black
-        if (!rtvs_cleared) {
-          auto black = create_black_texture_for_rtv_clear();
-          if (black) {
-            draw(black, out_Y_or_YUV_viewports_for_clear, out_UV_viewport_for_clear);
+        auto status = with_texture_lock(*img_ctx.encoder_mutex, [&] {
+          // Clear render target view(s) once so that the aspect ratio mismatch "bars" appear black
+          if (!rtvs_cleared) {
+            auto black = create_black_texture_for_rtv_clear();
+            if (black) {
+              draw(black, out_Y_or_YUV_viewports_for_clear, out_UV_viewport_for_clear);
+            }
+            rtvs_cleared = true;
           }
-          rtvs_cleared = true;
+
+          draw(img_ctx.encoder_input_res, out_Y_or_YUV_viewports, out_UV_viewport);
+          ID3D11ShaderResourceView *emptyShaderResourceView = nullptr;
+          device_ctx->PSSetShaderResources(0, 1, &emptyShaderResourceView);
+        });
+        if (texture_capture_result(status) != capture_e::ok) {
+          display->shared_texture_invalid = true;
+          return -1;
         }
-
-        // Draw captured frame
-        draw(img_ctx.encoder_input_res, out_Y_or_YUV_viewports, out_UV_viewport);
-
-        // Release encoder mutex to allow capture code to reuse this image
-        img_ctx.encoder_mutex->ReleaseSync(0);
-
-        ID3D11ShaderResourceView *emptyShaderResourceView = nullptr;
-        device_ctx->PSSetShaderResources(0, 1, &emptyShaderResourceView);
       }
 
       return 0;
@@ -789,7 +752,7 @@ namespace platf::dxgi {
       device_ctx->VSSetConstantBuffers(3, 1, &color_matrix);
       device_ctx->PSSetConstantBuffers(0, 1, &color_matrix);
 
-      this->display = std::dynamic_pointer_cast<display_base_t>(display);
+      this->display = std::dynamic_pointer_cast<display_vram_t>(display);
       if (!this->display) {
         return -1;
       }
@@ -939,7 +902,7 @@ namespace platf::dxgi {
     // amongst multiple hwdevice_t objects (and therefore multiple ID3D11Devices).
     std::map<uint32_t, encoder_img_ctx_t> img_ctx_map;
 
-    std::shared_ptr<display_base_t> display;
+    std::shared_ptr<display_vram_t> display;
 
     vs_t convert_Y_or_YUV_vs;
     ps_t convert_Y_or_YUV_ps;
@@ -1148,6 +1111,9 @@ namespace platf::dxgi {
   }
 
   capture_e display_ddup_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (shared_texture_invalid) {
+      return capture_e::reinit;
+    }
     HRESULT status;
     DXGI_OUTDUPL_FRAME_INFO frame_info;
 
@@ -1331,27 +1297,18 @@ namespace platf::dxgi {
       return true;
     };
 
-    auto get_locked_d3d_img = [&](std::shared_ptr<platf::img_t> &img, bool dummy = false) -> std::tuple<std::shared_ptr<img_d3d_t>, texture_lock_helper> {
-      auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
-
+    auto with_locked_img = [&](platf::img_t &img, auto access, bool dummy = false) {
+      auto &d3d_img = static_cast<img_d3d_t &>(img);
       // Finish creating the image (if it hasn't happened already),
       // also creates synchronization primitives for shared access from multiple direct3d devices.
-      if (complete_img(d3d_img.get(), dummy)) {
-        return {nullptr, nullptr};
+      if (complete_img(&d3d_img, dummy)) {
+        return capture_e::error;
       }
 
-      // This image is shared between capture direct3d device and encoders direct3d devices,
-      // we must acquire lock before doing anything to it.
-      texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
-      if (!lock_helper.lock()) {
-        BOOST_LOG(error) << "Failed to lock capture texture";
-        return {nullptr, nullptr};
-      }
-
-      // Clear the blank flag now that we're ready to capture into the image
-      d3d_img->blank = false;
-
-      return {std::move(d3d_img), std::move(lock_helper)};
+      return texture_capture_result(with_texture_lock(*d3d_img.capture_mutex, [&] {
+        d3d_img.blank = false;
+        access(d3d_img);
+      }));
     };
 
     switch (last_frame_action) {
@@ -1373,12 +1330,12 @@ namespace platf::dxgi {
             return capture_e::interrupted;
           }
 
-          auto [d3d_img, lock] = get_locked_d3d_img(img);
-          if (!d3d_img) {
-            return capture_e::error;
+          capture_status = with_locked_img(*img, [&](img_d3d_t &d3d_img) {
+            device_ctx->CopyResource(d3d_img.capture_texture.get(), p_surface->get());
+          });
+          if (capture_status != capture_e::ok) {
+            return capture_status;
           }
-
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
 
           // We delay the destruction of intermediate surface in case the mouse cursor reappears shortly.
           old_surface_delayed_destruction.reset(p_surface->release());
@@ -1395,19 +1352,17 @@ namespace platf::dxgi {
             BOOST_LOG(error) << "Logical error at " << __FILE__ << ":" << __LINE__;
             return capture_e::error;
           }
-          auto [d3d_img, lock] = get_locked_d3d_img(*p_img);
-          if (!d3d_img) {
-            return capture_e::error;
-          }
-
-          p_img = nullptr;
-          last_frame_variant = texture2d_t {};
-          auto &surface = std::get<texture2d_t>(last_frame_variant);
+          texture2d_t surface;
           if (!create_surface(surface)) {
             return capture_e::error;
           }
-
-          device_ctx->CopyResource(surface.get(), d3d_img->capture_texture.get());
+          capture_status = with_locked_img(**p_img, [&](img_d3d_t &d3d_img) {
+            device_ctx->CopyResource(surface.get(), d3d_img.capture_texture.get());
+          });
+          if (capture_status != capture_e::ok) {
+            return capture_status;
+          }
+          last_frame_variant = std::move(surface);
           break;
         }
 
@@ -1420,12 +1375,12 @@ namespace platf::dxgi {
             return capture_e::interrupted;
           }
 
-          auto [d3d_img, lock] = get_locked_d3d_img(img);
-          if (!d3d_img) {
-            return capture_e::error;
+          capture_status = with_locked_img(*img, [&](img_d3d_t &d3d_img) {
+            device_ctx->CopyResource(d3d_img.capture_texture.get(), src.get());
+          });
+          if (capture_status != capture_e::ok) {
+            return capture_status;
           }
-
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
           last_frame_variant = img;
           break;
         }
@@ -1505,13 +1460,13 @@ namespace platf::dxgi {
             return capture_e::interrupted;
           }
 
-          auto [d3d_img, lock] = get_locked_d3d_img(img_out);
-          if (!d3d_img) {
-            return capture_e::error;
+          capture_status = with_locked_img(*img_out, [&](img_d3d_t &d3d_img) {
+            device_ctx->CopyResource(d3d_img.capture_texture.get(), p_surface->get());
+            blend_cursor(d3d_img);
+          });
+          if (capture_status != capture_e::ok) {
+            return capture_status;
           }
-
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
-          blend_cursor(*d3d_img);
           break;
         }
 
@@ -1526,18 +1481,17 @@ namespace platf::dxgi {
           auto old_d3d_img = (img_d3d_t *) img_out.get();
           bool reclear_dummy = !old_d3d_img->blank && old_d3d_img->capture_texture;
 
-          auto [d3d_img, lock] = get_locked_d3d_img(img_out, true);
-          if (!d3d_img) {
-            return capture_e::error;
-          }
-
-          if (reclear_dummy) {
-            const float rgb_black[] = {0.0f, 0.0f, 0.0f, 0.0f};
-            device_ctx->ClearRenderTargetView(d3d_img->capture_rt.get(), rgb_black);
-          }
-
-          if (blend_mouse_cursor_flag) {
-            blend_cursor(*d3d_img);
+          capture_status = with_locked_img(*img_out, [&](img_d3d_t &d3d_img) {
+            if (reclear_dummy) {
+              const float rgb_black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+              device_ctx->ClearRenderTargetView(d3d_img.capture_rt.get(), rgb_black);
+            }
+            if (blend_mouse_cursor_flag) {
+              blend_cursor(d3d_img);
+            }
+          }, true);
+          if (capture_status != capture_e::ok) {
+            return capture_status;
           }
 
           break;
@@ -1647,6 +1601,9 @@ namespace platf::dxgi {
    * @param cursor_visible
    */
   capture_e display_wgc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (shared_texture_invalid) {
+      return capture_e::reinit;
+    }
     texture2d_t src;
     uint64_t frame_qpc;
     dup.set_cursor_visible(cursor_visible);
@@ -1679,18 +1636,16 @@ namespace platf::dxgi {
     }
 
     auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
-    d3d_img->blank = false;  // image is always ready for capture
-    if (complete_img(d3d_img.get(), false) == 0) {
-      texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
-      if (lock_helper.lock()) {
-        device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
-      } else {
-        BOOST_LOG(error) << "Failed to lock capture texture";
-        return capture_e::error;
-      }
-    } else {
+    if (complete_img(d3d_img.get(), false)) {
       return capture_e::error;
     }
+    capture_status = texture_capture_result(with_texture_lock(*d3d_img->capture_mutex, [&] {
+      device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+    }));
+    if (capture_status != capture_e::ok) {
+      return capture_status;
+    }
+    d3d_img->blank = false;
     img_out = img;
     if (img_out) {
       img_out->frame_timestamp = frame_timestamp;

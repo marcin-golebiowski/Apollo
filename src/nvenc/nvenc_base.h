@@ -102,12 +102,17 @@ namespace nvenc {
 
     /**
      * @brief Optional. Override if you want to create encoder in async mode.
-     *        In this case must also set `async_event_handle` variable.
-     * @param timeout_ms Wait timeout in milliseconds
+     *        In this case provide separate picture and end-of-stream events.
+     * @param timeout_ms Wait timeout in milliseconds.
+     * @param event_handle Event to wait on. The default selects the picture event.
      * @return Whether the frame completed, the interval elapsed, or the wait failed.
      */
-    virtual async_wait_result wait_for_async_event(uint32_t timeout_ms) {
+    virtual async_wait_result wait_for_async_event(uint32_t timeout_ms, void *event_handle = nullptr) {
       return async_wait_result::failed;
+    }
+
+    virtual bool device_removed() {
+      return false;
     }
 
     bool nvenc_failed(NVENCSTATUS status);
@@ -143,12 +148,19 @@ namespace nvenc {
                                                          ///< Should be set in `init_library()`.
     NV_ENC_REGISTERED_PTR registered_input_buffer = nullptr;  ///< Platform-specific input surface registered with `NvEncRegisterResource()`.
                                                               ///< Should be set in `create_and_register_input_buffer()`.
-    void *async_event_handle = nullptr;  ///< (optional) Platform-specific handle of event object event.
-                                         ///< Can be set in constructor or `init_library()`, must override `wait_for_async_event()`.
+    void *async_event_handle = nullptr;  ///< Picture completion event for asynchronous encoding.
+    void *flush_event_handle = nullptr;  ///< Separate event for end-of-stream completion.
 
   private:
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
+    NV_ENC_INPUT_PTR pending_input = nullptr;
+    bool waiting_for_completion = false;
+    bool frame_event_registered = false;
+    bool flush_event_registered = false;
     uint32_t minimum_api_version = 0;
+
+    void unmap_input(NV_ENC_INPUT_PTR input);
+    bool drain_pending_frame();
 
     struct {
       uint64_t last_encoded_frame_index = 0;

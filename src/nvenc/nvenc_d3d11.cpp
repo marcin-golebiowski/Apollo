@@ -13,6 +13,7 @@ namespace nvenc {
   nvenc_d3d11::nvenc_d3d11(NV_ENC_DEVICE_TYPE device_type):
       nvenc_base(device_type) {
     async_event_handle = CreateEvent(NULL, FALSE, FALSE, NULL);
+    flush_event_handle = CreateEvent(NULL, FALSE, FALSE, NULL);
   }
 
   nvenc_d3d11::~nvenc_d3d11() {
@@ -22,6 +23,9 @@ namespace nvenc {
     }
     if (async_event_handle) {
       CloseHandle(async_event_handle);
+    }
+    if (flush_event_handle) {
+      CloseHandle(flush_event_handle);
     }
   }
 
@@ -61,11 +65,26 @@ namespace nvenc {
     return false;
   }
 
-  async_wait_result nvenc_d3d11::wait_for_async_event(uint32_t timeout_ms) {
-    switch (WaitForSingleObject(async_event_handle, timeout_ms)) {
+  bool nvenc_d3d11::device_removed() {
+    if (auto *texture = get_input_texture()) {
+      ID3D11DevicePtr d3d_device;
+      texture->GetDevice(&d3d_device);
+      return FAILED(d3d_device->GetDeviceRemovedReason());
+    }
+    return false;
+  }
+
+  async_wait_result nvenc_d3d11::wait_for_async_event(uint32_t timeout_ms, void *event_handle) {
+    switch (WaitForSingleObject(event_handle ? event_handle : async_event_handle, timeout_ms)) {
       case WAIT_OBJECT_0:
         return async_wait_result::signaled;
       case WAIT_TIMEOUT:
+        // A reset device may never signal the last submitted picture. End the
+        // grace period (or the retiring session's drain) once removal is known.
+        if (device_removed()) {
+          BOOST_LOG(error) << "NvEnc: D3D11 device removed while waiting for frame completion";
+          return async_wait_result::failed;
+        }
         return async_wait_result::timeout;
       default:
         const auto error_code = GetLastError();

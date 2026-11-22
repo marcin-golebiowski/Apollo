@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 // local includes
@@ -54,9 +55,7 @@ namespace safe {
         }
       }
 
-      auto val = std::move(_status);
-      _status = util::false_v<status_t>;
-      return val;
+      return std::exchange(_status, util::false_v<status_t>);
     }
 
     // pop and view should not be used interchangeably
@@ -74,9 +73,15 @@ namespace safe {
         }
       }
 
-      auto val = std::move(_status);
-      _status = util::false_v<status_t>;
-      return val;
+      return std::exchange(_status, util::false_v<status_t>);
+    }
+
+    status_t try_pop() {
+      std::lock_guard lg {_lock};
+      if (!_continue) {
+        return util::false_v<status_t>;
+      }
+      return std::exchange(_status, util::false_v<status_t>);
     }
 
     // pop and view should not be used interchangeably
@@ -117,6 +122,7 @@ namespace safe {
     }
 
     bool peek() {
+      std::lock_guard lg {_lock};
       return _continue && (bool) _status;
     }
 
@@ -137,6 +143,7 @@ namespace safe {
     }
 
     [[nodiscard]] bool running() const {
+      std::lock_guard lg {_lock};
       return _continue;
     }
 
@@ -145,7 +152,7 @@ namespace safe {
     status_t _status {util::false_v<status_t>};
 
     std::condition_variable _cv;
-    std::mutex _lock;
+    mutable std::mutex _lock;
   };
 
   template<class T>
@@ -276,6 +283,7 @@ namespace safe {
     }
 
     bool peek() {
+      std::lock_guard lg {_lock};
       return _continue && !_queue.empty();
     }
 
@@ -333,6 +341,7 @@ namespace safe {
     }
 
     [[nodiscard]] bool running() const {
+      std::lock_guard lg {_lock};
       return _continue;
     }
 
@@ -340,7 +349,7 @@ namespace safe {
     bool _continue {true};
     std::uint32_t _max_elements;
 
-    std::mutex _lock;
+    mutable std::mutex _lock;
     std::condition_variable _cv;
 
     std::vector<T> _queue;

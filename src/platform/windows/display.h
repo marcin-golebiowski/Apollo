@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include <atomic>
+
 // platform includes
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -266,6 +268,9 @@ namespace platf::dxgi {
    */
   class display_vram_t: public display_base_t, public std::enable_shared_from_this<display_vram_t> {
   public:
+    // A failed handoff on an encoder's device invalidates textures on the capture device too.
+    std::atomic_bool shared_texture_invalid {false};
+
     std::shared_ptr<img_t> alloc_img() override;
     int dummy_img(img_t *img_base) override;
     int complete_img(img_t *img_base, bool dummy) override;

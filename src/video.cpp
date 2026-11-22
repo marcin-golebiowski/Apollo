@@ -23,6 +23,7 @@ extern "C" {
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
+#include "encoder_recovery.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -1299,7 +1300,11 @@ namespace video {
         }
 
         while (capture_ctx_queue->peek()) {
-          capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
+          auto next = capture_ctx_queue->pop();
+          if (!next) {
+            return false;
+          }
+          capture_ctxs.emplace_back(std::move(*next));
         }
 
         if (switch_display_event->peek()) {
@@ -1322,16 +1327,18 @@ namespace video {
         case platf::capture_e::reinit:
           {
             reinit_event.raise(true);
+            // Stop new encoders from taking a reference while the old display is draining.
+            display_wp = std::weak_ptr<platf::display_t> {};
 
             // Some classes of images contain references to the display --> display won't delete unless img is deleted
             for (auto &img : imgs) {
               img.reset();
             }
 
-            // display_wp is modified in this thread only
-            // Wait for the other shared_ptr's of display to be destroyed.
-            // New displays will only be created in this thread.
-            while (display_wp->use_count() != 1) {
+            while (disp.use_count() != 1) {
+              if (!capture_ctx_queue->running()) {
+                return;
+              }
               // Free images that weren't consumed by the encoders. These can reference the display and prevent
               // the ref count from reaching 1. We do this here rather than on the encoder thread to avoid race
               // conditions where the encoding loop might free a good frame after reinitializing if we capture
@@ -1342,14 +1349,22 @@ namespace video {
                   continue;
                 }
 
-                while (capture_ctx->images->peek()) {
-                  capture_ctx->images->pop();
-                }
+                // The encoder may already have consumed this single pending frame.
+                capture_ctx->images->try_pop();
 
                 ++capture_ctx;
               });
 
               std::this_thread::sleep_for(20ms);
+            }
+
+            if (capture_ctxs.empty()) {
+              // The old clients may have disconnected during the display reset.
+              auto next = capture_ctx_queue->pop();
+              if (!next) {
+                return;
+              }
+              capture_ctxs.emplace_back(std::move(*next));
             }
 
             while (capture_ctx_queue->running()) {
@@ -1361,8 +1376,8 @@ namespace video {
               refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
 
               // Process any pending display switch with the new list of displays
-              if (switch_display_event->peek()) {
-                display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
+              if (auto requested_display = switch_display_event->try_pop()) {
+                display_p = std::clamp(*requested_display, 0, (int) display_names.size() - 1);
               }
 
               // reset_display() will sleep between retries
@@ -1462,6 +1477,7 @@ namespace video {
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       packets->raise(std::move(packet));
+      session.produced_packet = true;
     }
 
     return 0;
@@ -1483,6 +1499,7 @@ namespace video {
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
     packets->raise(std::move(packet));
+    session.produced_packet = true;
 
     return 0;
   }
@@ -1889,7 +1906,19 @@ namespace video {
     return nullptr;
   }
 
-  void encode_run(
+  // NVENC driver cleanup can block, especially after a frame timed out.
+  // The worker owns the session and its buffers until cleanup completes.
+  static void defer_encoder_teardown(const encoder_t &encoder, std::unique_ptr<encode_session_t> &session) {
+    if (encoder.flags & ASYNC_TEARDOWN) {
+      std::thread([session = std::move(session)]() mutable {
+        BOOST_LOG(info) << "Starting async encoder teardown";
+        session.reset();
+        BOOST_LOG(info) << "Async encoder teardown complete";
+      }).detach();
+    }
+  }
+
+  encode_run_result_t encode_run(
     int &frame_nr,  // Store progress of the frame number
     safe::mail_t mail,
     img_event_t images,
@@ -1902,24 +1931,11 @@ namespace video {
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
-      return;
+      return {.failed = true};
     }
 
-    // As a workaround for NVENC hangs and to generally speed up encoder reinit,
-    // we will complete the encoder teardown in a separate thread if supported.
-    // This will move expensive processing off the encoder thread to allow us
-    // to restart encoding as soon as possible. For cases where the NVENC driver
-    // hang occurs, this thread may probably never exit, but it will allow
-    // streaming to continue without requiring a full restart of Sunshine.
     auto fail_guard = util::fail_guard([&encoder, &session] {
-      if (encoder.flags & ASYNC_TEARDOWN) {
-        std::thread encoder_teardown_thread {[session = std::move(session)]() mutable {
-          BOOST_LOG(info) << "Starting async encoder teardown";
-          session.reset();
-          BOOST_LOG(info) << "Async encoder teardown complete";
-        }};
-        encoder_teardown_thread.detach();
-      }
+      defer_encoder_teardown(encoder, session);
     });
 
     // set max frame time based on client-requested target framerate.
@@ -1943,7 +1959,7 @@ namespace video {
       // in a separate scope.
       auto dummy_img = disp->alloc_img();
       if (!dummy_img || disp->dummy_img(dummy_img.get()) || session->convert(*dummy_img)) {
-        return;
+        return {.failed = true};
       }
     }
 
@@ -1953,12 +1969,12 @@ namespace video {
       // Encode the dummy img only once
       if (encode(frame_nr++, *session, packets, channel_data, std::chrono::steady_clock::now())) {
         BOOST_LOG(error) << "Could not encode dummy video packet"sv;
-        return;
+        return {.failed = true};
       }
 
       while (true) {
         if (shutdown_event->peek() || !images->running() || (reinit_event.peek())) {
-          return;
+          return {.produced_packet = session->produced_packet};
         } else {
           std::this_thread::sleep_for(300ms);
         }
@@ -1976,7 +1992,7 @@ namespace video {
       // If we have to reinit before we have received any captured frames, we will encode
       // the blank dummy frame just to let Moonlight know that we're alive.
       if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
-        break;
+        return {.produced_packet = session->produced_packet};
       }
 
       bool requested_idr_frame = false;
@@ -2022,7 +2038,7 @@ namespace video {
 
           encode_frame_timestamp += encode_frame_threshold;
         } else if (!images->running()) {
-          break;
+          return {.produced_packet = session->produced_packet};
         }
       }
 
@@ -2033,6 +2049,7 @@ namespace video {
 
       session->request_normal_frame();
     }
+    return {.failed = true, .produced_packet = session->produced_packet};
   }
 
   input::touch_port_t make_port(platf::display_t *display, const config_t &config) {
@@ -2342,13 +2359,14 @@ namespace video {
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
+    auto ref = capture_thread_async.ref();
     auto images = std::make_shared<img_event_t::element_type>();
+    // Wake capture before releasing the last reference, which joins its thread.
     auto lg = util::fail_guard([&]() {
       images->stop();
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
     if (!ref) {
       return;
     }
@@ -2367,21 +2385,22 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
+    encoder_recovery_t recovery;
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
       if (ref->reinit_event.peek()) {
-        std::this_thread::sleep_for(20ms);
+        shutdown_event->view(20ms);
         continue;
       }
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
       {
         auto lg = ref->display_wp.lock();
-        if (ref->display_wp->expired()) {
-          continue;
-        }
-
         display = ref->display_wp->lock();
+      }
+      if (!display) {
+        shutdown_event->view(20ms);
+        continue;
       }
 
       auto &encoder = *chosen_encoder;
@@ -2405,17 +2424,26 @@ namespace video {
       }
       hdr_event->raise(std::move(hdr_info));
 
-      encode_run(
+      auto result = encode_run(
         frame_nr,
         mail,
         images,
         config,
-        display,
+        std::move(display),
         std::move(encode_device),
         ref->reinit_event,
         *ref->encoder_p,
         channel_data
       );
+      auto delay = recovery.retry_delay(result);
+      if (!delay) {
+        BOOST_LOG(error) << "Ending stream after repeated encoder failures without video output";
+        return;
+      }
+      if (delay->count() > 0) {
+        BOOST_LOG(warning) << "Retrying failed encoder in " << delay->count() << " ms";
+        shutdown_event->view(*delay);
+      }
     }
   }
 
@@ -2477,6 +2505,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     while (!packets->peek()) {
       if (encode(1, *session, packets, nullptr, {})) {
+        defer_encoder_teardown(encoder, session);
         return -1;
       }
     }
