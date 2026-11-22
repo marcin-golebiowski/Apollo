@@ -282,6 +282,18 @@ namespace safe {
       _cv.notify_all();
     }
 
+    // Use for items that must be consumed or explicitly rejected.
+    template<class... Args>
+    bool try_raise(Args &&...args) {
+      std::lock_guard lg {_lock};
+      if (!_continue || _queue.size() >= _max_elements) {
+        return false;
+      }
+      _queue.emplace_back(std::forward<Args>(args)...);
+      _cv.notify_all();
+      return true;
+    }
+
     bool peek() {
       std::lock_guard lg {_lock};
       return _continue && !_queue.empty();

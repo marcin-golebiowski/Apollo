@@ -23,6 +23,7 @@ extern "C" {
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
+#include "display_recovery.h"
 #include "encoder_recovery.h"
 #include "globals.h"
 #include "input.h"
@@ -1060,7 +1061,6 @@ namespace video {
         break;
       }
 
-      // The capture code depends on us to sleep between failures
       std::this_thread::sleep_for(200ms);
     }
   }
@@ -1072,7 +1072,7 @@ namespace video {
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, std::string &preferred_display_name) {
+  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, const std::string &preferred_display_name = {}) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
     const auto output_name { display_device::map_output_name(config::video.output_name) };
     std::string current_display_name = preferred_display_name;
@@ -1123,9 +1123,41 @@ namespace video {
     }
   }
 
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
-    static std::string empty_str = "";
-    refresh_displays(dev_type, display_names, current_display_index, empty_str);
+  static bool display_recovery_expired(std::chrono::steady_clock::time_point deadline) {
+    if (std::chrono::steady_clock::now() < deadline) {
+      return false;
+    }
+    BOOST_LOG(error) << "Display recovery timed out after " << display_recovery_t::timeout.count()
+                     << " seconds. Ending affected streams.";
+    return true;
+  }
+
+  template<class GetConfig>
+  static std::shared_ptr<platf::display_t> recover_display(
+    const encoder_t &encoder, std::vector<std::string> &display_names, int &display_index,
+    const std::string &preferred_display_name, std::chrono::steady_clock::time_point deadline, GetConfig get_config
+  ) {
+    auto switch_display = mail::man->event<int>(mail::switch_display);
+    auto dev_type = encoder.platform_formats->dev_type;
+    while (!display_recovery_expired(deadline)) {
+      const auto *config = get_config();
+      if (!config || display_recovery_expired(deadline)) {
+        return nullptr;
+      }
+      refresh_displays(dev_type, display_names, display_index, preferred_display_name);
+      if (display_recovery_expired(deadline)) {
+        return nullptr;
+      }
+      if (auto requested_display = switch_display->try_pop()) {
+        display_index = std::clamp(*requested_display, 0, (int) display_names.size() - 1);
+      }
+      auto display = platf::display(dev_type, display_names[display_index], *config);
+      if (display) {
+        return display_recovery_expired(deadline) ? nullptr : display;
+      }
+      std::this_thread::sleep_until(std::min(deadline, std::chrono::steady_clock::now() + display_recovery_t::retry_interval));
+    }
+    return nullptr;
   }
 
   void captureThread(
@@ -1277,6 +1309,7 @@ namespace video {
     // Capture takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
+    display_recovery_t recovery;
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
@@ -1312,6 +1345,8 @@ namespace video {
           return false;
         }
 
+        // A frame or a normal idle callback confirms capture has resumed.
+        recovery.capture_resumed();
         return true;
       };
 
@@ -1329,6 +1364,7 @@ namespace video {
             reinit_event.raise(true);
             // Stop new encoders from taking a reference while the old display is draining.
             display_wp = std::weak_ptr<platf::display_t> {};
+            const auto deadline = recovery.begin();
 
             // Some classes of images contain references to the display --> display won't delete unless img is deleted
             for (auto &img : imgs) {
@@ -1336,7 +1372,7 @@ namespace video {
             }
 
             while (disp.use_count() != 1) {
-              if (!capture_ctx_queue->running()) {
+              if (!capture_ctx_queue->running() || display_recovery_expired(deadline)) {
                 return;
               }
               // Free images that weren't consumed by the encoders. These can reference the display and prevent
@@ -1358,39 +1394,28 @@ namespace video {
               std::this_thread::sleep_for(20ms);
             }
 
-            if (capture_ctxs.empty()) {
-              // The old clients may have disconnected during the display reset.
-              auto next = capture_ctx_queue->pop();
-              if (!next) {
-                return;
+            // Some backends allow just one capture session per output.
+            disp.reset();
+            auto get_config = [&]() -> const config_t * {
+              if (!capture_ctx_queue->running()) {
+                return nullptr;
               }
-              capture_ctxs.emplace_back(std::move(*next));
-            }
-
-            while (capture_ctx_queue->running()) {
-              // Release the display before reenumerating displays, since some capture backends
-              // only support a single display session per device/application.
-              disp.reset();
-
-              // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
-
-              // Process any pending display switch with the new list of displays
-              if (auto requested_display = switch_display_event->try_pop()) {
-                display_p = std::clamp(*requested_display, 0, (int) display_names.size() - 1);
+              std::erase_if(capture_ctxs, [](const auto &ctx) { return !ctx.images->running(); });
+              if (capture_ctxs.empty()) {
+                auto next = capture_ctx_queue->pop(deadline - std::chrono::steady_clock::now());
+                if (!next) {
+                  return nullptr;
+                }
+                capture_ctxs.emplace_back(std::move(*next));
               }
-
-              // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
-              if (disp) {
-                proc::proc.display_name = display_names[display_p];
-                break;
-              }
-            }
+              return &capture_ctxs.front().config;
+            };
+            disp = recover_display(encoder, display_names, display_p, proc::proc.display_name, deadline, get_config);
             if (!disp) {
               return;
             }
 
+            proc::proc.display_name = display_names[display_p];
             display_wp = disp;
 
             reinit_event.reset();
@@ -2177,11 +2202,10 @@ namespace video {
     std::vector<std::unique_ptr<sync_session_ctx_t>> &synced_session_ctxs,
     encode_session_ctx_queue_t &encode_session_ctx_queue,
     std::vector<std::string> &display_names,
-    int &display_p
+    int &display_p,
+    display_recovery_t &recovery
   ) {
     const auto &encoder = *chosen_encoder;
-
-    std::shared_ptr<platf::display_t> disp;
 
     auto switch_display_event = mail::man->event<int>(mail::switch_display);
 
@@ -2194,22 +2218,24 @@ namespace video {
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
 
-    while (encode_session_ctx_queue.running()) {
-      // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-
-      // Process any pending display switch with the new list of displays
-      if (switch_display_event->peek()) {
-        display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
+    auto get_config = [&]() -> const config_t * {
+      if (!encode_session_ctx_queue.running()) {
+        return nullptr;
       }
-
-      // reset_display() will sleep between retries
-      reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
-      if (disp) {
-        break;
+      while (auto pending = encode_session_ctx_queue.pop(0ms)) {
+        synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*pending)));
       }
-    }
-
+      std::erase_if(synced_session_ctxs, [](auto &ctx) {
+        if (!ctx->shutdown_event->peek()) {
+          return false;
+        }
+        ctx->join_event->raise(true);
+        return true;
+      });
+      return synced_session_ctxs.empty() ? nullptr : &synced_session_ctxs.front()->config;
+    };
+    const auto deadline = recovery.begin();
+    auto disp = recover_display(encoder, display_names, display_p, {}, deadline, get_config);
     if (!disp) {
       return encode_e::error;
     }
@@ -2301,6 +2327,8 @@ namespace video {
           return false;
         }
 
+        // A delivered frame or a normal idle poll confirms capture is working again.
+        recovery.capture_resumed();
         return true;
       };
 
@@ -2349,7 +2377,8 @@ namespace video {
 
     std::vector<std::string> display_names;
     int display_p = -1;
-    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
+    display_recovery_t recovery;
+    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p, recovery) == encode_e::reinit) {}
   }
 
   void capture_async(
@@ -2371,9 +2400,7 @@ namespace video {
       return;
     }
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config});
-
-    if (!ref->capture_ctx_queue->running()) {
+    if (!ref->capture_ctx_queue->try_raise(capture_ctx_t {images, config})) {
       return;
     }
 
@@ -2460,7 +2487,7 @@ namespace video {
     } else {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
-      ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
+      bool queued = ref->encode_session_ctx_queue.try_raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
         mail::man->queue<packet_t>(mail::video_packets),
@@ -2472,8 +2499,9 @@ namespace video {
         channel_data,
       });
 
-      // Wait for join signal
-      join_event.view();
+      if (queued) {
+        join_event.view();
+      }
     }
   }
 
