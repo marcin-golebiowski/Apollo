@@ -32,6 +32,8 @@ namespace {
       return create_encoder({}, stream, {}, NV_ENC_BUFFER_FORMAT_NV12);
     }
 
+    using nvenc_base::retirement_timeout;
+
     Calls calls;
     uint32_t ready_after_ms = 0;
     uint32_t flush_ready_after_ms = 0;
@@ -41,6 +43,7 @@ namespace {
     unsigned lose_after_flush_waits = 0;
     std::vector<void *> registered_events, unregistered_events;
     NVENCSTATUS submit_status = NV_ENC_SUCCESS;
+    NVENCSTATUS flush_status = NV_ENC_SUCCESS;
     NVENCSTATUS lock_status = NV_ENC_SUCCESS;
 
   private:
@@ -101,7 +104,7 @@ namespace {
           EXPECT_EQ(picture->inputBuffer, nullptr);
           EXPECT_EQ(picture->completionEvent, &self.flush_event);
           self.retiring = true;
-          return NV_ENC_SUCCESS;
+          return self.flush_status;
         }
         EXPECT_EQ(picture->inputBuffer, &self.mapped);
         EXPECT_EQ(picture->outputBitstream, &self.output);
@@ -167,6 +170,11 @@ namespace {
 
     bool device_removed() override {
       return lost;
+    }
+
+    void pause_before_retry(std::chrono::milliseconds duration) override {
+      EXPECT_EQ(duration, std::chrono::seconds(1));
+      calls.emplace_back("pause");
     }
 
     nvenc::async_wait_result wait_for_async_event(uint32_t timeout_ms, void *handle) override {
@@ -290,6 +298,34 @@ namespace {
     encoder.calls.clear();
     encoder.destroy_encoder();
     EXPECT_EQ(encoder.calls, (Calls {"flush", "drain wait", "flush wait", "flush wait", "flush wait", "destroy encoder"}));
+  }
+
+  TEST(NvencTimeoutTest, UnsignaledFlushReleasesTheSessionAtTheTimeLimit) {
+    FakeEncoder encoder;
+    ASSERT_TRUE(encoder.open());
+    encoder.retirement_timeout = std::chrono::seconds(3);
+    encoder.ready_after_ms = 300;
+    encoder.flush_ready_after_ms = UINT32_MAX;
+    EXPECT_TRUE(encoder.encode_frame(17, false).data.empty());
+    encoder.calls.clear();
+    encoder.destroy_encoder();
+    EXPECT_EQ(encoder.calls, (Calls {"flush", "drain wait", "flush wait", "flush wait", "flush wait", "unmap", "destroy bitstream", "unregister input", "destroy encoder"}));
+    EXPECT_EQ(encoder.registered_events, encoder.unregistered_events);
+    ASSERT_TRUE(encoder.open());
+    EXPECT_EQ(encoder.encode_frame(18, false).frame_index, 18u);
+  }
+
+  TEST(NvencTimeoutTest, RejectedFlushIsRetriedUntilTheTimeLimit) {
+    FakeEncoder encoder;
+    ASSERT_TRUE(encoder.open());
+    encoder.retirement_timeout = std::chrono::seconds(2);
+    encoder.ready_after_ms = 300;
+    encoder.flush_status = NV_ENC_ERR_GENERIC;
+    EXPECT_TRUE(encoder.encode_frame(17, false).data.empty());
+    encoder.calls.clear();
+    encoder.destroy_encoder();
+    EXPECT_EQ(encoder.calls, (Calls {"flush", "pause", "flush", "pause", "flush", "unmap", "destroy bitstream", "unregister input", "destroy encoder"}));
+    EXPECT_EQ(encoder.registered_events, encoder.unregistered_events);
   }
 
   TEST(NvencTimeoutTest, FailedFlushRegistrationReleasesOnlyTheRegisteredEvent) {

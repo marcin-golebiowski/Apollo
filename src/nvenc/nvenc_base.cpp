@@ -5,6 +5,7 @@
 // this include
 #include "nvenc_base.h"
 
+#include <algorithm>
 #include <thread>
 
 // local includes
@@ -468,11 +469,19 @@ namespace nvenc {
     }
   }
 
-  bool nvenc_base::drain_pending_frame() {
-    // A live device still owns the mapping. Retirement may outlast the stream,
-    // but only confirmed device loss can replace proof of completion. Neither
-    // a timeout nor a transient driver error permits freeing these resources.
-    auto finish = [this](const char *operation, auto call) {
+  void nvenc_base::pause_before_retry(std::chrono::milliseconds duration) {
+    std::this_thread::sleep_for(duration);
+  }
+
+  nvenc_base::drain_result nvenc_base::drain_pending_frame() {
+    // A live device still owns the mapping, so wait for proof of completion
+    // before freeing these resources. Confirmed device loss ends the wait early.
+    // Waits and retry pauses share one budget, so a driver that never answers
+    // cannot keep the session, and its NVENC slot, alive until Apollo exits.
+    constexpr std::chrono::milliseconds interval {1000};
+    auto budget = retirement_timeout;
+    auto failure = drain_result::timed_out;
+    auto finish = [&](const char *operation, auto call) {
       bool reported = false;
       for (;;) {
         auto status = call();
@@ -485,56 +494,74 @@ namespace nvenc {
           reported = true;
         }
         if (status == NV_ENC_ERR_DEVICE_NOT_EXIST || device_removed()) {
+          failure = drain_result::device_lost;
           return false;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (budget <= budget.zero()) {
+          failure = drain_result::timed_out;
+          return false;
+        }
+        const auto pause = std::min(interval, budget);
+        pause_before_retry(pause);
+        budget -= pause;
       }
     };
-    auto wait = [this](void *event) {
-      for (;;) {
-        auto result = wait_for_async_event(1000, event);
+    auto wait = [&](void *event) {
+      while (budget > budget.zero()) {
+        const auto slice = std::min(interval, budget);
+        auto result = wait_for_async_event(static_cast<uint32_t>(slice.count()), event);
         if (result == async_wait_result::signaled) {
           return true;
         }
         if (device_removed()) {
+          failure = drain_result::device_lost;
           return false;
         }
         if (result == async_wait_result::failed) {
           // A failed OS wait returns immediately, unlike a timeout.
-          std::this_thread::sleep_for(std::chrono::seconds(1));
+          pause_before_retry(slice);
         }
+        budget -= slice;
       }
+      failure = drain_result::timed_out;
+      return false;
     };
     NV_ENC_PIC_PARAMS eos = {min_struct_version(NV_ENC_PIC_PARAMS_VER, 4, 6)};
     eos.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
     eos.completionEvent = flush_event_registered ? flush_event_handle : nullptr;
     if (!finish("flush", [&] { return nvenc->nvEncEncodePicture(encoder, &eos); })) {
-      return false;
+      return failure;
     }
     if (waiting_for_completion && !wait(async_event_handle)) {
-      return false;
+      return failure;
     }
     if (flush_event_registered && !wait(flush_event_handle)) {
-      return false;
+      return failure;
     }
     NV_ENC_LOCK_BITSTREAM lock = {min_struct_version(NV_ENC_LOCK_BITSTREAM_VER, 1, 2)};
     lock.outputBitstream = output_bitstream;
     lock.doNotWait = frame_event_registered;
     if (!finish("lock bitstream", [&] { return nvenc->nvEncLockBitstream(encoder, &lock); })) {
-      return false;
+      return failure;
     }
     if (!finish("unlock bitstream", [&] { return nvenc->nvEncUnlockBitstream(encoder, output_bitstream); })) {
-      return false;
+      return failure;
     }
-    return finish("unmap input", [&] { return nvenc->nvEncUnmapInputResource(encoder, pending_input); });
+    return finish("unmap input", [&] { return nvenc->nvEncUnmapInputResource(encoder, pending_input); }) ? drain_result::drained : failure;
   }
 
   void nvenc_base::destroy_encoder() {
-    const bool drained = !pending_input || drain_pending_frame();
-    if (!drained) {
+    const auto drain = pending_input ? drain_pending_frame() : drain_result::drained;
+    if (drain == drain_result::device_lost) {
       BOOST_LOG(error) << "NvEnc: device lost while draining a submitted frame; closing the invalidated session";
+    } else if (drain == drain_result::timed_out) {
+      BOOST_LOG(error) << "NvEnc: submitted frame did not retire within " << std::chrono::duration<double>(retirement_timeout).count()
+                       << " s; releasing the session without confirmation";
+      // Past the limit, fall back to upstream's teardown, which never waited for the frame.
+      unmap_input(pending_input);
     }
-    if (drained && output_bitstream) {
+    const bool release = drain != drain_result::device_lost;
+    if (release && output_bitstream) {
       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
       }
@@ -546,13 +573,13 @@ namespace nvenc {
         BOOST_LOG(error) << "NvEnc: NvEncUnregisterAsyncEvent() failed: " << last_nvenc_error_string;
       }
     };
-    if (drained && frame_event_registered) {
+    if (release && frame_event_registered) {
       unregister_event(async_event_handle);
     }
-    if (drained && flush_event_registered) {
+    if (release && flush_event_registered) {
       unregister_event(flush_event_handle);
     }
-    if (drained && registered_input_buffer) {
+    if (release && registered_input_buffer) {
       if (nvenc_failed(nvenc->nvEncUnregisterResource(encoder, registered_input_buffer))) {
         BOOST_LOG(error) << "NvEnc: NvEncUnregisterResource() failed: " << last_nvenc_error_string;
       }

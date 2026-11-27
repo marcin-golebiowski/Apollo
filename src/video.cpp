@@ -25,6 +25,7 @@ extern "C" {
 #include "display_device.h"
 #include "display_recovery.h"
 #include "encoder_recovery.h"
+#include "encoder_teardown.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -1931,14 +1932,38 @@ namespace video {
     return nullptr;
   }
 
+  // NVENC stops waiting for a submitted frame after 20 s, so a teardown pending
+  // longer than this is blocked inside the driver.
+  constexpr auto stuck_teardown_age = 30s;
+
+  // Never destroyed: detached teardown threads can outlive static destruction.
+  static encoder_teardowns_t &encoder_teardowns() {
+    static auto *teardowns = new encoder_teardowns_t;
+    return *teardowns;
+  }
+
+  static void log_pending_teardowns() {
+    const auto status = encoder_teardowns().status(std::chrono::steady_clock::now());
+    if (!status.pending) {
+      return;
+    }
+    auto &severity = status.oldest > stuck_teardown_age ? warning : info;
+    BOOST_LOG(severity) << "Encoder teardowns still running: "sv << status.pending << " (oldest started "sv
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(status.oldest).count() << " ms ago)"sv;
+  }
+
   // NVENC driver cleanup can block, especially after a frame timed out.
   // The worker owns the session and its buffers until cleanup completes.
   static void defer_encoder_teardown(const encoder_t &encoder, std::unique_ptr<encode_session_t> &session) {
     if (encoder.flags & ASYNC_TEARDOWN) {
-      std::thread([session = std::move(session)]() mutable {
-        BOOST_LOG(info) << "Starting async encoder teardown";
+      const auto started = std::chrono::steady_clock::now();
+      const auto pending = encoder_teardowns().begin(started);
+      std::thread([session = std::move(session), started, pending]() mutable {
+        BOOST_LOG(info) << "Starting async encoder teardown (pending: "sv << pending << ')';
         session.reset();
-        BOOST_LOG(info) << "Async encoder teardown complete";
+        const auto remaining = encoder_teardowns().end(started);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+        BOOST_LOG(info) << "Async encoder teardown complete after "sv << elapsed.count() << " ms (pending: "sv << remaining << ')';
       }).detach();
     }
   }
@@ -1954,6 +1979,7 @@ namespace video {
     const encoder_t &encoder,
     void *channel_data
   ) {
+    log_pending_teardowns();
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
       return {.failed = true};
@@ -2755,6 +2781,8 @@ namespace video {
     if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
       return 0;
     }
+
+    log_pending_teardowns();
 
     // Restart encoder selection
     auto previous_encoder = chosen_encoder;

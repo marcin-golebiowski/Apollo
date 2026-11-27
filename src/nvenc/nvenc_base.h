@@ -4,6 +4,9 @@
  */
 #pragma once
 
+// standard includes
+#include <chrono>
+
 // lib includes
 #include <ffnvcodec/nvEncodeAPI.h>
 
@@ -115,6 +118,12 @@ namespace nvenc {
       return false;
     }
 
+    /**
+     * @brief Wait before retrying a driver call while retiring a submitted frame.
+     * @param duration Time to wait.
+     */
+    virtual void pause_before_retry(std::chrono::milliseconds duration);
+
     bool nvenc_failed(NVENCSTATUS status);
 
     /**
@@ -150,8 +159,16 @@ namespace nvenc {
                                                               ///< Should be set in `create_and_register_input_buffer()`.
     void *async_event_handle = nullptr;  ///< Picture completion event for asynchronous encoding.
     void *flush_event_handle = nullptr;  ///< Separate event for end-of-stream completion.
+    std::chrono::milliseconds retirement_timeout = std::chrono::seconds(20);  ///< Longest wait for a submitted frame to retire before
+                                                                              ///< `destroy_encoder()` releases the session anyway.
 
   private:
+    enum class drain_result {
+      drained,
+      device_lost,
+      timed_out,
+    };
+
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
     NV_ENC_INPUT_PTR pending_input = nullptr;
     bool waiting_for_completion = false;
@@ -160,7 +177,7 @@ namespace nvenc {
     uint32_t minimum_api_version = 0;
 
     void unmap_input(NV_ENC_INPUT_PTR input);
-    bool drain_pending_frame();
+    drain_result drain_pending_frame();
 
     struct {
       uint64_t last_encoded_frame_index = 0;
